@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test e2/test/*.test.js"
+    "test": "node --test e1/test/*.test.js e2/test/*.test.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
