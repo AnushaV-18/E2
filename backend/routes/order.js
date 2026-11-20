@@ -1,7 +1,10 @@
 const express = require("express");
 const pool = require("../config/db");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const e2 = require("../e2");
+const scheduler = require("../e1");
+const { RetryableError } = require("../e1/errors");
 
 const router = express.Router();
 
@@ -19,7 +22,88 @@ function getCustomer(req, res) {
     }
 }
 
-// Place an order, then let the E2 engine pick the warehouse(s)
+// ---- the work for ONE order (runs inside an E1 worker) ----
+// Returns { status, body } for the HTTP reply. It throws RetryableError only while nothing is committed yet.
+async function placeOrder({ customer_id, product_id, quantity, region_id, tier }) {
+    let client;
+    let order;
+
+    try {
+        client = await pool.connect();
+        await client.query("BEGIN");
+
+        // Lock this product's inventory row so two buyers can't oversell it
+        const inventoryResult = await client.query(
+            `SELECT stock_quantity FROM inventory WHERE product_id = $1 FOR UPDATE`,
+            [product_id]
+        );
+
+        if (inventoryResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return { status: 404, body: { message: "Product not found." } };
+        }
+
+        if (inventoryResult.rows[0].stock_quantity < quantity) {
+            await client.query("ROLLBACK");
+            return { status: 409, body: { message: "Sorry, not enough stock for this product." } };
+        }
+
+        await client.query(
+            `UPDATE inventory
+             SET stock_quantity = stock_quantity - $1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE product_id = $2`,
+            [quantity, product_id]
+        );
+
+        const orderResult = await client.query(
+            `INSERT INTO orders (customer_id, product_id, quantity, status, order_type, shipping_region_id)
+             VALUES ($1, $2, $3, 'CONFIRMED', $4, $5)
+             RETURNING order_id, customer_id, product_id, quantity, status, order_type`,
+            [customer_id, product_id, quantity, tier, region_id]
+        );
+        order = orderResult.rows[0];
+
+        await client.query(
+            `INSERT INTO order_details (order_id, product_id, quantity) VALUES ($1, $2, $3)`,
+            [order.order_id, product_id, quantity]
+        );
+
+        await client.query("COMMIT");
+    } catch (error) {
+        if (client) await client.query("ROLLBACK").catch(() => {});
+        console.error("Order error:", error.message);
+        // Nothing was committed, so the scheduler may safely try this order once more.
+        throw new RetryableError("order transaction failed", error);
+    } finally {
+        if (client) client.release();
+    }
+
+    // The order is saved (committed). From here on we never retry. Now E2 chooses the warehouse(s).
+    try {
+        const allocation = await e2.allocate({
+            orderId: order.order_id,
+            tier,
+            regionId: region_id,
+            items: [{ productId: product_id, quantity }]
+        });
+
+        if (allocation.status !== "ALLOCATED") {
+            // E3 already cancelled the order and gave the stock back
+            return { status: 409, body: { message: "Sorry, no warehouse could supply this order. It was cancelled." } };
+        }
+
+        await pool.query("UPDATE orders SET status = 'ALLOCATED' WHERE order_id = $1", [order.order_id]);
+        order.status = "ALLOCATED";
+
+        return { status: 201, body: { message: "Order placed successfully!", order, allocation } };
+    } catch (error) {
+        console.error("Allocation error:", error.message);
+        return { status: 201, body: { message: "Order placed. Warehouse allocation is pending.", order, allocation: null } };
+    }
+}
+
+// Place an order: validate, then hand it to the E1 scheduler (queue -> worker -> placeOrder)
 router.post("/", async (req, res) => {
     const customer_id = Number(req.body.customer_id);
     const product_id = Number(req.body.product_id);
@@ -48,93 +132,43 @@ router.post("/", async (req, res) => {
         });
     }
 
-    let client;
-    let order;
+    // The client sends one request_id per order click; a repeat (double click, retry) is rejected.
+    const requestId = String(req.body.request_id || req.get("Idempotency-Key") || crypto.randomUUID());
 
     try {
-        client = await pool.connect();
-        await client.query("BEGIN");
-
-        // Lock this product's inventory row so two buyers can't oversell it
-        const inventoryResult = await client.query(
-            `SELECT stock_quantity FROM inventory WHERE product_id = $1 FOR UPDATE`,
-            [product_id]
-        );
-
-        if (inventoryResult.rows.length === 0) {
-            await client.query("ROLLBACK");
-            return res.status(404).json({ message: "Product not found." });
-        }
-
-        if (inventoryResult.rows[0].stock_quantity < quantity) {
-            await client.query("ROLLBACK");
-            return res.status(409).json({
-                message: "Sorry, not enough stock for this product."
-            });
-        }
-
-        await client.query(
-            `UPDATE inventory
-             SET stock_quantity = stock_quantity - $1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE product_id = $2`,
-            [quantity, product_id]
-        );
-
-        const orderResult = await client.query(
-            `INSERT INTO orders (customer_id, product_id, quantity, status, order_type, shipping_region_id)
-             VALUES ($1, $2, $3, 'CONFIRMED', $4, $5)
-             RETURNING order_id, customer_id, product_id, quantity, status, order_type`,
-            [customer_id, product_id, quantity, tier, region_id]
-        );
-        order = orderResult.rows[0];
-
-        await client.query(
-            `INSERT INTO order_details (order_id, product_id, quantity) VALUES ($1, $2, $3)`,
-            [order.order_id, product_id, quantity]
-        );
-
-        await client.query("COMMIT");
-    } catch (error) {
-        if (client) await client.query("ROLLBACK").catch(() => {});
-        console.error("Order error:", error.message);
-        return res.status(500).json({ message: "Failed to place order." });
-    } finally {
-        if (client) client.release();
-    }
-
-    // The order is saved. Now E2 chooses the warehouse(s).
-    try {
-        const allocation = await e2.allocate({
-            orderId: order.order_id,
+        const out = await scheduler.submit({
+            requestId,
             tier,
-            regionId: region_id,
-            items: [{ productId: product_id, quantity }]
+            key: `product:${product_id}`,   // orders for the same product never run at the same time
+            run: () => placeOrder({ customer_id, product_id, quantity, region_id, tier })
         });
-
-        if (allocation.status !== "ALLOCATED") {
-            // E3 already cancelled the order and gave the stock back
-            return res.status(409).json({
-                message: "Sorry, no warehouse could supply this order. It was cancelled."
-            });
-        }
-
-        await pool.query("UPDATE orders SET status = 'ALLOCATED' WHERE order_id = $1", [order.order_id]);
-        order.status = "ALLOCATED";
-
-        return res.status(201).json({
-            message: "Order placed successfully!",
-            order,
-            allocation
-        });
+        return res.status(out.status).json({ ...out.body, request_id: requestId });
     } catch (error) {
-        console.error("Allocation error:", error.message);
-        return res.status(201).json({
-            message: "Order placed. Warehouse allocation is pending.",
-            order,
-            allocation: null
-        });
+        if (error && error.status) {
+            if (error.status === 503) res.set("Retry-After", "2");
+            return res.status(error.status).json({ message: error.message });
+        }
+        console.error("Order scheduling error:", error.message);
+        return res.status(500).json({ message: "Failed to place order." });
     }
+});
+
+// Processing status of one order request: QUEUED, RUNNING, DONE, FAILED or UNKNOWN
+router.get("/status/:requestId", (req, res) => {
+    if (!getCustomer(req, res)) return;
+    res.json({ request_id: req.params.requestId, status: scheduler.status(req.params.requestId) });
+});
+
+// E1 queue / worker metrics for the dashboard (staff only: Bearer E2_TOKEN)
+router.get("/metrics", (req, res) => {
+    const expected = process.env.E2_TOKEN;
+    if (!expected) return res.status(503).json({ message: "Set E2_TOKEN in backend/.env first." });
+    const given = Buffer.from((req.get("authorization") || "").replace(/^Bearer\s+/i, ""));
+    const want = Buffer.from(expected);
+    if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) {
+        return res.status(401).json({ message: "Unauthorized." });
+    }
+    res.json(scheduler.metrics());
 });
 
 // The logged-in customer's orders with their shipments

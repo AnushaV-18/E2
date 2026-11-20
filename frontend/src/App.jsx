@@ -167,6 +167,8 @@ function App() {
             quantity: item.qty,
             region_id: regionId,
             tier: plus ? "PLUS" : "REGULAR",
+            // one ID per order click: E1 rejects a repeat (double click / retry) instead of ordering twice
+            request_id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
           },
           { headers: { Authorization: `Bearer ${auth.token}` } }
         );
